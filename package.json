@@ -1,0 +1,7 @@
+{
+  "name": "medical-sandbox",
+  "private": true,
+  "scripts": {
+    "test": "node test_service.js"
+  }
+}

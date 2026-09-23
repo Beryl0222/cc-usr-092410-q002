@@ -1,0 +1,199 @@
+{
+  "actors": [
+    {"id": "S-LIN", "name": "林学生", "roles": ["student"], "institution": "本校医学院"},
+    {"id": "S-WANG", "name": "王学生", "roles": ["student"], "institution": "合作医科大学"},
+    {"id": "S-GAO", "name": "高学生", "roles": ["student"], "institution": "合作医科大学"},
+    {"id": "T-CHEN", "name": "陈教师", "roles": ["teacher"], "institution": "本校医学院"},
+    {"id": "T-ZHAO", "name": "赵教师", "roles": ["teacher"], "institution": "合作医科大学"}
+  ],
+  "courses": [
+    {
+      "id": "C-LOCAL",
+      "name": "本校细胞图谱实训",
+      "starts_at": "2026-03-01T08:00:00",
+      "ends_at": "2026-06-30T23:59:59",
+      "institutions": ["本校医学院"],
+      "cross_institutional": false
+    },
+    {
+      "id": "C-CROSS",
+      "name": "跨校罕见血液病联合课程",
+      "starts_at": "2026-03-15T08:00:00",
+      "ends_at": "2026-05-15T23:59:59",
+      "institutions": ["本校医学院", "合作医科大学"],
+      "cross_institutional": true
+    }
+  ],
+  "cases": [
+    {
+      "id": "CASE-AML",
+      "title": "急性髓系白血病单细胞图谱",
+      "description": "两家附属医院的骨髓样本单细胞转录组教学病例（虚构数据）",
+      "courses": ["C-LOCAL", "C-CROSS"]
+    },
+    {
+      "id": "CASE-T2D",
+      "title": "2 型糖尿病胰岛细胞图谱",
+      "description": "仅本校课程使用的对照教学病例（虚构数据）",
+      "courses": ["C-LOCAL"]
+    }
+  ],
+  "policies": [
+    {
+      "id": "POL-K5",
+      "version": 1,
+      "k_threshold": 5,
+      "transforms": {
+        "age": "generalize:10",
+        "city": "drop"
+      },
+      "note": "每个导出分组至少 5 例；年龄按十岁段泛化；城市字段不下发"
+    }
+  ],
+  "environments": [
+    {
+      "id": "ENV-SCANPY",
+      "version": 1,
+      "tools": {"python": "3.11.9", "scanpy": "1.9.8", "pandas": "2.2.1"},
+      "released_at": "2026-02-01T00:00:00",
+      "note": "春季学期初标准镜像"
+    },
+    {
+      "id": "ENV-SCANPY",
+      "version": 2,
+      "tools": {"python": "3.11.9", "scanpy": "1.10.4", "pandas": "2.2.2"},
+      "released_at": "2026-05-01T00:00:00",
+      "note": "scanpy 升级至 1.10.4，差异表达默认参数变化"
+    }
+  ],
+  "snapshots": [
+    {
+      "case_id": "CASE-AML",
+      "version": 1,
+      "released_at": "2026-02-20T00:00:00",
+      "identity_fields": ["patient_id", "patient_name", "phone"],
+      "rows": [
+        {"patient_id": "P-001", "patient_name": "虚构甲", "phone": "13800000001", "age": 42, "city": "本市", "diagnosis": "AML-M2", "cell_type": "原始粒细胞", "marker": "CD34+"},
+        {"patient_id": "P-002", "patient_name": "虚构乙", "phone": "13800000002", "age": 45, "city": "本市", "diagnosis": "AML-M2", "cell_type": "原始粒细胞", "marker": "CD34+"},
+        {"patient_id": "P-003", "patient_name": "虚构丙", "phone": "13800000003", "age": 38, "city": "外市", "diagnosis": "AML-M2", "cell_type": "早幼粒细胞", "marker": "CD13+"},
+        {"patient_id": "P-004", "patient_name": "虚构丁", "phone": "13800000004", "age": 51, "city": "本市", "diagnosis": "AML-M2", "cell_type": "原始粒细胞", "marker": "HLA-DR+"},
+        {"patient_id": "P-005", "patient_name": "虚构戊", "phone": "13800000005", "age": 47, "city": "外市", "diagnosis": "AML-M2", "cell_type": "原始粒细胞", "marker": "CD34+"},
+        {"patient_id": "P-006", "patient_name": "虚构己", "phone": "13800000006", "age": 34, "city": "本市", "diagnosis": "AML-M5", "cell_type": "单核细胞", "marker": "CD14+"},
+        {"patient_id": "P-007", "patient_name": "虚构庚", "phone": "13800000007", "age": 29, "city": "外市", "diagnosis": "AML-M5", "cell_type": "单核细胞", "marker": "CD64+"},
+        {"patient_id": "P-008", "patient_name": "虚构辛", "phone": "13800000008", "age": 31, "city": "本市", "diagnosis": "AML-M5", "cell_type": "单核细胞", "marker": "CD14+"}
+      ]
+    },
+    {
+      "case_id": "CASE-AML",
+      "version": 2,
+      "released_at": "2026-05-10T00:00:00",
+      "replaces": 1,
+      "erratum_note": "P-003 细胞类型注释由早幼粒细胞更正为异常早幼粒细胞（APL 疑点）",
+      "identity_fields": ["patient_id", "patient_name", "phone"],
+      "rows": [
+        {"patient_id": "P-001", "patient_name": "虚构甲", "phone": "13800000001", "age": 42, "city": "本市", "diagnosis": "AML-M2", "cell_type": "原始粒细胞", "marker": "CD34+"},
+        {"patient_id": "P-002", "patient_name": "虚构乙", "phone": "13800000002", "age": 45, "city": "本市", "diagnosis": "AML-M2", "cell_type": "原始粒细胞", "marker": "CD34+"},
+        {"patient_id": "P-003", "patient_name": "虚构丙", "phone": "13800000003", "age": 38, "city": "外市", "diagnosis": "AML-M2", "cell_type": "异常早幼粒细胞", "marker": "CD13+"},
+        {"patient_id": "P-004", "patient_name": "虚构丁", "phone": "13800000004", "age": 51, "city": "本市", "diagnosis": "AML-M2", "cell_type": "原始粒细胞", "marker": "HLA-DR+"},
+        {"patient_id": "P-005", "patient_name": "虚构戊", "phone": "13800000005", "age": 47, "city": "外市", "diagnosis": "AML-M2", "cell_type": "原始粒细胞", "marker": "CD34+"},
+        {"patient_id": "P-006", "patient_name": "虚构己", "phone": "13800000006", "age": 34, "city": "本市", "diagnosis": "AML-M5", "cell_type": "单核细胞", "marker": "CD14+"},
+        {"patient_id": "P-007", "patient_name": "虚构庚", "phone": "13800000007", "age": 29, "city": "外市", "diagnosis": "AML-M5", "cell_type": "单核细胞", "marker": "CD64+"},
+        {"patient_id": "P-008", "patient_name": "虚构辛", "phone": "13800000008", "age": 31, "city": "本市", "diagnosis": "AML-M5", "cell_type": "单核细胞", "marker": "CD14+"}
+      ]
+    }
+  ],
+  "consents": [
+    {
+      "id": "CONS-AML-TEACH",
+      "case_id": "CASE-AML",
+      "course_id": null,
+      "granted_at": "2026-02-25T00:00:00",
+      "scope_note": "覆盖两门口径内教学课程，仅限脱敏切片在限时沙箱内使用，禁止再识别"
+    }
+  ],
+  "enrollments": [
+    {"student_id": "S-LIN", "course_id": "C-LOCAL", "status": "沙箱运行"},
+    {"student_id": "S-WANG", "course_id": "C-CROSS", "status": "沙箱运行"},
+    {"student_id": "S-GAO", "course_id": "C-CROSS", "status": "沙箱运行"}
+  ],
+  "teachers": [
+    {"teacher_id": "T-CHEN", "course_id": "C-LOCAL"},
+    {"teacher_id": "T-ZHAO", "course_id": "C-CROSS"}
+  ],
+  "tasks": [
+    {
+      "id": "TASK-LOCAL-Q1",
+      "course_id": "C-LOCAL",
+      "case_id": "CASE-AML",
+      "objective_fields": ["age", "diagnosis", "cell_type", "marker"],
+      "policy_id": "POL-K5",
+      "environment_id": "ENV-SCANPY",
+      "created_at": "2026-03-05T09:00:00"
+    },
+    {
+      "id": "TASK-CROSS-Q1",
+      "course_id": "C-CROSS",
+      "case_id": "CASE-AML",
+      "objective_fields": ["age", "diagnosis", "cell_type", "marker"],
+      "policy_id": "POL-K5",
+      "environment_id": "ENV-SCANPY",
+      "created_at": "2026-03-20T09:00:00"
+    },
+    {
+      "id": "TASK-LOCAL-Q2",
+      "course_id": "C-LOCAL",
+      "case_id": "CASE-AML",
+      "objective_fields": ["age", "diagnosis", "cell_type", "marker"],
+      "policy_id": "POL-K5",
+      "environment_id": "ENV-SCANPY",
+      "created_at": "2026-05-12T09:00:00"
+    }
+  ],
+  "assignments": [
+    {
+      "id": "AS-LIN-01",
+      "task_id": "TASK-LOCAL-Q1",
+      "student_id": "S-LIN",
+      "conclusion": "AML-M2 组原始粒细胞占比高，CD34 阳性为主",
+      "recipe": [
+        {"step": "质控与归一化", "tool": "scanpy"},
+        {"step": "聚类与细胞类型注释", "tool": "scanpy"}
+      ],
+      "status": "已评分",
+      "submitted_at": "2026-04-10T20:00:00",
+      "graded_at": "2026-04-15T10:00:00",
+      "grade": "A",
+      "reviews": [
+        {"teacher_id": "T-CHEN", "at": "2026-04-15T10:00:00", "grade": "A", "note": "方法与结论一致", "stage": "评分"}
+      ]
+    },
+    {
+      "id": "AS-WANG-01",
+      "task_id": "TASK-CROSS-Q1",
+      "student_id": "S-WANG",
+      "conclusion": "AML-M5 单核细胞亚群标记待确认（草稿）",
+      "recipe": [
+        {"step": "质控与归一化", "tool": "scanpy"}
+      ],
+      "status": "进行中",
+      "submitted_at": "2026-04-20T20:00:00"
+    },
+    {
+      "id": "AS-GAO-01",
+      "task_id": "TASK-CROSS-Q1",
+      "student_id": "S-GAO",
+      "conclusion": "跨校样本与本校样本的 M2 群在 CD34 表达上无显著差异",
+      "recipe": [
+        {"step": "质控与归一化", "tool": "scanpy"},
+        {"step": "差异表达检验", "tool": "scanpy"}
+      ],
+      "status": "已评分",
+      "submitted_at": "2026-04-22T20:00:00",
+      "graded_at": "2026-04-28T10:00:00",
+      "grade": "B+",
+      "reviews": [
+        {"teacher_id": "T-ZHAO", "at": "2026-04-28T10:00:00", "grade": "B+", "note": "跨批次效应讨论不足", "stage": "评分"}
+      ]
+    }
+  ]
+}
