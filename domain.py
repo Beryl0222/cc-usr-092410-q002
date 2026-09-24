@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import threading
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
@@ -43,6 +44,14 @@ EXPORT_APPROVED = "通过"
 EXPORT_BLOCKED = "阻断"
 ASSIGNMENT_OPEN = "进行中"
 
+# 快照登记结果与被拒导入原因
+REGISTER_FIRST = "首次登记"
+REJECT_CONTENT = "异内容覆盖"
+REJECT_REPLACES_MISSING = "替代目标缺失"
+REJECT_REPLACES_ORDER = "替代关系乱序"
+REJECT_REPLACES_CYCLE = "替代关系成环"
+REJECT_CORRUPT = "快照内容损坏"
+
 
 class SandboxError(Exception):
     """沙箱规则违例的基类。"""
@@ -54,6 +63,21 @@ class NotFound(SandboxError):
 
 class AuthorizationError(SandboxError):
     """身份不具备所需能力，或授权已失效。"""
+
+
+class SnapshotRegistrationError(SandboxError):
+    """快照登记违例：异内容覆盖、重放不一致或替代链非法。
+
+    ``reason`` 取本模块的 ``REJECT_*`` / ``REPLAY_*`` 常量；
+    ``diff`` 列出具体不一致的身份字段；冲突导入本身被记入拒绝账，不进入快照账。
+    """
+
+    def __init__(self, reason: str, message: str, diff: Optional[list[str]] = None,
+                 rejected: Optional[dict] = None) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.diff = diff or []
+        self.rejected = rejected
 
 
 def parse_time(value: str) -> datetime:
@@ -101,6 +125,14 @@ class Sandbox:
         self.enrollments: list[dict] = []
         self.teacher_courses: list[dict] = []
         self.audit: list[dict] = []
+        # 被拒绝的快照导入（异内容覆盖、重放不一致、非法替代链、并发抢登）；
+        # 只追加，不覆盖原快照——审计与追溯视图从这里取“被拒绝的导入”
+        self.rejected_imports: list[dict] = []
+        # 夹具/持久化装载时被隔离的条目（与 rejected_imports 对应，供重启巡检）
+        self.load_warnings: list[dict] = []
+        # 同一 (病例, 版本) 的登记必须串行判定：并发导入时只有一个首次提交者
+        self._snapshot_locks: dict[tuple[str, int], threading.Lock] = {}
+        self._locks_guard = threading.Lock()
         self._seq = 0
 
     # ---- 装载 -----------------------------------------------------------
@@ -132,13 +164,26 @@ class Sandbox:
                 released_at=parse_time(env["released_at"]), note=env.get("note", ""),
             )
         for snapshot in data.get("snapshots", []):
-            box.add_snapshot(
-                snapshot["case_id"], snapshot["version"], snapshot["rows"],
-                identity_fields=snapshot.get("identity_fields", []),
-                released_at=parse_time(snapshot["released_at"]),
-                replaces=snapshot.get("replaces"),
-                erratum_note=snapshot.get("erratum_note", ""),
-            )
+            # 装载路径与在线登记走同一套身份与替代链校验：坏快照被隔离进
+            # rejected_imports，其余账目照常恢复（重启后不被坏数据污染）
+            try:
+                box.add_snapshot(
+                    snapshot["case_id"], snapshot["version"], snapshot["rows"],
+                    identity_fields=snapshot.get("identity_fields", []),
+                    released_at=parse_time(snapshot["released_at"]),
+                    replaces=snapshot.get("replaces"),
+                    erratum_note=snapshot.get("erratum_note", ""),
+                    submitted_by=snapshot.get("submitted_by", "种子装载"),
+                    expected_content_hash=snapshot.get("content_hash"),
+                )
+            except SnapshotRegistrationError as exc:
+                box.load_warnings.append({
+                    "case_id": snapshot.get("case_id"),
+                    "version": snapshot.get("version"),
+                    "reason": exc.reason,
+                    "diff": exc.diff,
+                    "message": str(exc),
+                })
         for grant in data.get("consents", []):
             box.grant_consent(
                 grant["id"], grant["case_id"],
@@ -152,13 +197,28 @@ class Sandbox:
         for link in data.get("teachers", []):
             box.assign_teacher(link["teacher_id"], link["course_id"])
         for task in data.get("tasks", []):
-            box.create_task(
-                task["id"], task["course_id"], task["case_id"],
-                task["objective_fields"], task["policy_id"], task["environment_id"],
-                now=parse_time(task["created_at"]),
-                snapshot_version=task.get("snapshot_version"),
-            )
+            # 引用了被隔离快照/环境的任务一并隔离，不能让一条坏数据阻断整库恢复
+            try:
+                box.create_task(
+                    task["id"], task["course_id"], task["case_id"],
+                    task["objective_fields"], task["policy_id"], task["environment_id"],
+                    now=parse_time(task["created_at"]),
+                    snapshot_version=task.get("snapshot_version"),
+                )
+            except SandboxError as exc:
+                box.load_warnings.append({
+                    "task_id": task.get("id"), "reason": type(exc).__name__,
+                    "message": str(exc),
+                })
         for assignment in data.get("assignments", []):
+            if assignment["task_id"] not in box.tasks:
+                box.load_warnings.append({
+                    "assignment_id": assignment.get("id"),
+                    "reason": "任务缺失",
+                    "message": f"作业 {assignment.get('id')} 引用的任务未通过装载校验，"
+                               f"一并隔离",
+                })
+                continue
             box._load_assignment(assignment)
         box._reconcile_flags()
         return box
@@ -268,33 +328,207 @@ class Sandbox:
     def add_snapshot(self, case_id: str, version: int, rows: list[dict],
                      identity_fields: list[str], released_at: datetime,
                      replaces: Optional[int] = None,
-                     erratum_note: str = "") -> dict:
+                     erratum_note: str = "",
+                     submitted_by: Optional[str] = None,
+                     submitted_at: Optional[datetime] = None,
+                     expected_content_hash: Optional[str] = None) -> dict:
+        """登记一个病例快照版本。
+
+        ``(病例编号, 版本号)`` 是不可变身份。身份由五部分共同确定：
+        规范化内容摘要、身份字段集合、发布时间、替代关系、勘误说明。
+
+        - 身份完全一致的重复提交：幂等返回原记录（精确重放），任何账目不改写；
+        - 任一部分不一致：拒绝登记，原样保留既有快照、任务、切片、导出与已评分
+          作业，冲突导入进入 ``rejected_imports`` 并抛 :class:`SnapshotRegistrationError`；
+        - ``replaces`` 指向的版本必须存在、版本号必须更低且沿替代链不成环，
+          否则拒绝登记；
+        - 同一 ``(病例, 版本)`` 的并发登记串行判定，只有一个首次提交者；
+        - 合法新版本沿完整替代链给引用链上任一旧版本的已评分作业追加风险标记。
+        """
         if case_id not in self.cases:
             raise NotFound(f"未知病例：{case_id}")
-        record = {
+        submitted_by = submitted_by or "数据管理员"
+        submitted_at = submitted_at or released_at
+        candidate = self._snapshot_identity(
+            case_id, version, rows, identity_fields, released_at,
+            replaces, erratum_note)
+
+        # 同一身份键的判定必须串行：并发导入同一版本时只有一个首次提交者
+        with self._snapshot_lock((case_id, version)):
+            # 装载恢复时，行数据必须与登记时固化的规范化摘要一致；
+            # 存储被篡改（同版本异内容）在这里即被隔离，不进入快照账
+            if (expected_content_hash is not None
+                    and expected_content_hash != candidate["content_hash"]):
+                self._reject_import(
+                    REJECT_CORRUPT, submitted_by, submitted_at,
+                    {**candidate, "expected_content_hash": expected_content_hash},
+                    None, ["content_hash"],
+                    f"病例 {case_id} v{version} 的内容摘要与登记摘要不符，"
+                    f"存储可能被篡改或损坏")
+            existing = self.snapshots.get((case_id, version))
+            if existing is not None:
+                existing_identity = self._stored_identity(existing)
+                if canon(existing_identity) == canon(candidate):
+                    # 精确重放：幂等返回，首次提交者与既有账目不被改写
+                    self.audit.append({
+                        "at": submitted_at.isoformat(), "action": "快照精确重放",
+                        "case_id": case_id, "version": version,
+                        "submitted_by": submitted_by,
+                        "first_submitted_by": existing["registered_by"],
+                    })
+                    return existing
+                diff = [name for name in candidate
+                        if canon(existing_identity.get(name)) != canon(candidate[name])]
+                self._reject_import(
+                    REJECT_CONTENT, submitted_by, submitted_at, candidate,
+                    existing_identity, diff,
+                    f"病例 {case_id} 版本 v{version} 已由 "
+                    f"{existing['registered_by']} 提交且内容不可变；"
+                    f"冲突字段：{','.join(diff)}")
+                # _reject_import 抛出异常，以下存储逻辑不会执行
+
+            # 新身份：先校验替代关系，乱序/成环/目标缺失一律不得进入存储
+            self._validate_replaces(case_id, version, replaces,
+                                    submitted_by, submitted_at, candidate)
+
+            record = {
+                "case_id": case_id,
+                "version": version,
+                "rows": rows,
+                "identity_fields": list(identity_fields),
+                "released_at": released_at,
+                "replaces": replaces,
+                "erratum_note": erratum_note,
+                "content_hash": digest(rows),
+                "registered_by": submitted_by,
+                "register_status": REGISTER_FIRST,
+            }
+            self.snapshots[(case_id, version)] = record
+            self.audit.append({
+                "at": submitted_at.isoformat(), "action": "快照首次登记",
+                "case_id": case_id, "version": version,
+                "submitted_by": submitted_by, "replaces": replaces,
+                "content_hash": record["content_hash"],
+            })
+            # 影响面标记与登记在同一临界区：沿完整替代链找引用旧版本的作业，
+            # v3 替代 v2、v2 替代 v1 时，基于 v1 的作业同样面对 v3 的新数据。
+            # _flag 按作业幂等，精确重放不会重复追加。
+            if replaces is not None:
+                chain = self._replaces_chain(case_id, replaces)
+                for assignment in self.assignments.values():
+                    fp = assignment.get("fingerprint")
+                    if (fp and fp["snapshot"]["case_id"] == case_id
+                            and fp["snapshot"]["version"] in chain):
+                        self._flag(assignment, {
+                            "type": "病例勘误",
+                            "at": released_at.isoformat(),
+                            "detail": erratum_note
+                            or f"病例已发布 v{version}，结论基于 v{fp['snapshot']['version']}",
+                            "current_version": version,
+                        })
+        return record
+
+    def _snapshot_lock(self, key: tuple[str, int]) -> threading.Lock:
+        with self._locks_guard:
+            lock = self._snapshot_locks.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                self._snapshot_locks[key] = lock
+            return lock
+
+    @staticmethod
+    def _snapshot_identity(case_id: str, version: int, rows: list[dict],
+                           identity_fields: list[str], released_at: datetime,
+                           replaces: Optional[int],
+                           erratum_note: str) -> dict:
+        """构成快照不可变身份的五个部分（病例与版本为身份键）。"""
+        return {
             "case_id": case_id,
             "version": version,
-            "rows": rows,
-            "identity_fields": identity_fields,
-            "released_at": released_at,
-            "replaces": replaces,
-            "erratum_note": erratum_note,
-            "content_hash": digest(rows),
+            "content_hash": digest(rows),              # 规范化内容
+            "identity_fields": sorted(identity_fields),
+            "released_at": released_at.isoformat(),    # 发布时间
+            "replaces": replaces,                      # 替代关系
+            "erratum_note": erratum_note,              # 勘误说明
         }
-        self.snapshots[(case_id, version)] = record
-        # 新版本发布：给引用旧版本的已评分作业追加风险标记
-        if replaces is not None:
-            for assignment in self.assignments.values():
-                fp = assignment.get("fingerprint")
-                if (fp and fp["snapshot"]["case_id"] == case_id
-                        and fp["snapshot"]["version"] == replaces):
-                    self._flag(assignment, {
-                        "type": "病例勘误",
-                        "at": released_at.isoformat(),
-                        "detail": erratum_note or f"病例已发布 v{version}，结论基于 v{replaces}",
-                        "current_version": version,
-                    })
-        return record
+
+    def _stored_identity(self, record: dict) -> dict:
+        return self._snapshot_identity(
+            record["case_id"], record["version"], record["rows"],
+            record["identity_fields"], record["released_at"],
+            record["replaces"], record["erratum_note"])
+
+    def _validate_replaces(self, case_id: str, version: int,
+                           replaces: Optional[int], submitted_by: str,
+                           submitted_at: Optional[datetime],
+                           candidate: dict) -> None:
+        if replaces is None:
+            return
+        if replaces == version:
+            self._reject_import(
+                REJECT_REPLACES_CYCLE, submitted_by, submitted_at, candidate,
+                None, ["replaces"],
+                f"病例 {case_id} v{version} 不能替代自身")
+        if replaces > version:
+            self._reject_import(
+                REJECT_REPLACES_ORDER, submitted_by, submitted_at, candidate,
+                None, ["replaces"],
+                f"病例 {case_id} v{version} 不能替代更高版本 v{replaces}")
+        if (case_id, replaces) not in self.snapshots:
+            self._reject_import(
+                REJECT_REPLACES_MISSING, submitted_by, submitted_at, candidate,
+                None, ["replaces"],
+                f"病例 {case_id} v{version} 的替代目标 v{replaces} 不存在")
+        # 沿替代链前行，若回到当前版本则成环（含经由历史节点的闭环）
+        seen: set[int] = set()
+        cursor = replaces
+        while cursor is not None:
+            if cursor == version:
+                self._reject_import(
+                    REJECT_REPLACES_CYCLE, submitted_by, submitted_at, candidate,
+                    None, ["replaces"],
+                    f"病例 {case_id} 的替代关系在 v{version} 处成环")
+            if cursor in seen:  # 防御：历史链本身异常
+                self._reject_import(
+                    REJECT_REPLACES_CYCLE, submitted_by, submitted_at, candidate,
+                    None, ["replaces"],
+                    f"病例 {case_id} 的替代关系经过 v{cursor} 时成环")
+            seen.add(cursor)
+            cursor = self.snapshots[(case_id, cursor)]["replaces"]
+
+    def _replaces_chain(self, case_id: str, version: int) -> set[int]:
+        """返回 v``version`` 及其沿替代关系追溯到的全部旧版本号。"""
+        chain: set[int] = set()
+        cursor: Optional[int] = version
+        while cursor is not None and cursor not in chain:
+            chain.add(cursor)
+            record = self.snapshots.get((case_id, cursor))
+            cursor = record["replaces"] if record else None
+        return chain
+
+    def _reject_import(self, reason: str, submitted_by: str,
+                       submitted_at: Optional[datetime], candidate: dict,
+                       existing: Optional[dict], diff: list[str],
+                       message: str) -> None:
+        """把被拒绝的导入只追加进拒绝账与审计账，然后抛出登记违例。"""
+        entry = {
+            "reason": reason,
+            "at": (submitted_at.isoformat() if submitted_at else None),
+            "submitted_by": submitted_by,
+            "case_id": candidate.get("case_id"),
+            "version": candidate.get("version"),
+            "candidate": candidate,
+            "existing": existing,
+            "diff": diff,
+            "message": message,
+        }
+        self.rejected_imports.append(entry)
+        self.audit.append({
+            "at": entry["at"], "action": "快照导入被拒",
+            "case_id": entry["case_id"], "version": entry["version"],
+            "reason": reason, "diff": diff, "submitted_by": submitted_by,
+        })
+        raise SnapshotRegistrationError(reason, message, diff=diff, rejected=entry)
 
     def add_environment(self, env_id: str, version: int, tools: dict[str, str],
                         released_at: datetime, note: str = "") -> dict:
@@ -843,6 +1077,67 @@ class Sandbox:
             "教师复核": list(assignment["reviews"]),
             "风险标记": list(assignment["risk_flags"]),
             "fingerprint": assignment["fingerprint"],
+            "快照谱系": self._lineage_payload(
+                task["case_id"],
+                frozen_version=(assignment["fingerprint"] or {}).get(
+                    "snapshot", {}).get("version", task["snapshot_version"])),
+        }
+
+    def case_lineage(self, case_id: str) -> dict:
+        """病例维度的版本谱系：版本链、当前有效版本、被拒绝的导入。
+
+        供教师在不打开某份作业时解释“旧作业冻结的是哪版数据、现在有效是哪版、
+        哪些重传曾被系统拒绝”。
+        """
+        if case_id not in self.cases:
+            raise NotFound(f"未知病例：{case_id}")
+        return self._lineage_payload(case_id)
+
+    def _lineage_payload(self, case_id: str,
+                         frozen_version: Optional[int] = None) -> dict:
+        versions = sorted(
+            (snap for (cid, _ver), snap in self.snapshots.items()
+             if cid == case_id),
+            key=lambda snap: snap["version"])
+        current = versions[-1] if versions else None
+        return {
+            "case_id": case_id,
+            # 冻结摘要：作业钉住的版本及其规范化内容摘要
+            "frozen": (
+                {"version": frozen_version,
+                 "content_hash": self.snapshots[(case_id, frozen_version)]["content_hash"],
+                 "released_at": self.snapshots[(case_id, frozen_version)]["released_at"].isoformat()}
+                if frozen_version is not None
+                and (case_id, frozen_version) in self.snapshots else None),
+            # 当前有效版本：账内最高版本（勘误只发新版本，旧版永不覆盖）
+            "current": (None if current is None else {
+                "version": current["version"],
+                "content_hash": current["content_hash"],
+                "released_at": current["released_at"].isoformat(),
+                "replaces": current["replaces"],
+                "erratum_note": current.get("erratum_note", ""),
+                "registered_by": current.get("registered_by"),
+            }),
+            "current_version": current["version"] if current else None,
+            "versions": [
+                {"version": snap["version"],
+                 "content_hash": snap["content_hash"],
+                 "released_at": snap["released_at"].isoformat(),
+                 "replaces": snap["replaces"],
+                 "erratum_note": snap.get("erratum_note", ""),
+                 "registered_by": snap.get("registered_by"),
+                 "status": snap.get("register_status", REGISTER_FIRST)}
+                for snap in versions],
+            "superseded": frozen_version is not None and current is not None
+                          and frozen_version < current["version"],
+            # 被拒绝的导入：异内容覆盖/重放不一致/乱序或成环替代/并发抢登
+            "rejected_imports": [
+                {"reason": entry["reason"], "at": entry["at"],
+                 "submitted_by": entry["submitted_by"],
+                 "version": entry["version"], "diff": entry["diff"],
+                 "message": entry["message"]}
+                for entry in self.rejected_imports
+                if entry["case_id"] == case_id],
         }
 
     # ---- 查询 -----------------------------------------------------------
